@@ -1,0 +1,51 @@
+# edge_gate configuration
+
+listen = "127.0.0.1:8400"
+
+[upstreams.openai]
+url = "https://api.openai.com"
+# api_key = "sk-..."   # or pass Authorization header through from the client
+
+# Point any OpenAI-compatible endpoint at edge_gate:
+#   curl http://127.0.0.1:8400/v1/chat/completions ...
+# Or pick a named upstream explicitly:
+#   curl http://127.0.0.1:8400/local/v1/chat/completions ...
+#
+# [upstreams.local]
+# url = "http://127.0.0.1:8080"     # e.g. ollama / llama.cpp / badapple
+
+[dedup]
+enabled = true
+min_similarity = 0.6   # Jaccard similarity; higher = stricter
+cache_size = 1024
+
+[blinding]
+enabled = true
+unblind_response = true
+# Literal substrings to blind before requests leave this machine.
+# One per line in a file works too:
+# patterns_file = "~/.edge_gate/secrets.txt"
+patterns = []
+
+[filter]
+enabled = false
+# blocklist = ["some phrase", "another"]
+
+[tarpit]
+enabled = true
+requests_per_second = 5.0
+burst = 10
+delay_ms = 500
+
+[audit]
+path = "edge_gate_ledger.jsonl"
+record_bodies = false   # keep false — the ledger is metadata, not a transcript
+
+# USD per 1M tokens, per model. Used for metering + dedup savings.
+[costs."gpt-4o"]
+input_per_mtok = 2.50
+output_per_mtok = 10.00
+
+[costs."gpt-4o-mini"]
+input_per_mtok = 0.15
+output_per_mtok = 0.60
