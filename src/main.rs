@@ -37,7 +37,16 @@ enum Cmd {
         ledger: std::path::PathBuf,
         #[arg(short, long, default_value = "edge_gate_checkpoint.json")]
         out: std::path::PathBuf,
+        /// Sign the checkpoint with this ed25519 secret (hex).
+        /// Use --key-file to avoid putting it on the command line.
+        #[arg(long)]
+        key: Option<String>,
+        /// File containing the ed25519 secret (hex).
+        #[arg(long)]
+        key_file: Option<std::path::PathBuf>,
     },
+    /// Generate an ed25519 keypair for signed checkpoints.
+    Keygen,
 }
 
 #[tokio::main]
@@ -72,13 +81,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Cmd::Checkpoint { ledger, out } => {
-            let cp = audit::checkpoint(&ledger, &out)?;
+        Cmd::Checkpoint {
+            ledger,
+            out,
+            key,
+            key_file,
+        } => {
+            let secret = match (key, key_file) {
+                (Some(k), _) => Some(k),
+                (None, Some(f)) => Some(std::fs::read_to_string(f)?.trim().to_string()),
+                (None, None) => None,
+            };
+            let cp = audit::checkpoint(&ledger, &out, secret.as_deref())?;
             println!(
-                "checkpoint written: {} entries, tip {}",
+                "checkpoint written: {} entries, tip {}{}",
                 cp["entries"],
-                &cp["tip_hash"].as_str().unwrap_or("")[..16]
+                &cp["tip_hash"].as_str().unwrap_or("")[..16],
+                if cp["signature"].is_string() {
+                    " (signed)"
+                } else {
+                    ""
+                }
             );
+        }
+        Cmd::Keygen => {
+            let (secret, public) = audit::keygen();
+            println!("public:  {public}");
+            println!("secret:  {secret}");
+            println!("keep the secret offline; sign with --key-file <file containing it>");
         }
         Cmd::Serve { config } => {
             let cfg = config::Config::load(&config)?;

@@ -26,15 +26,37 @@ fn bench_feature_set(c: &mut Criterion) {
 }
 
 fn bench_dedup_lookup(c: &mut Criterion) {
+    // realistic: mostly-distinct prompts — the index prunes nearly all
     let d = Deduper::new(0.6, 1024);
+    let topics = [
+        "rust borrow checker lifetimes",
+        "french cooking techniques",
+        "quantum entanglement basics",
+        "kubernetes pod scheduling",
+        "jazz chord progressions",
+        "kubernetes pod scheduling", // repeat to allow a hit
+    ];
     for i in 0..1024 {
         d.put(
+            &format!("{} question variant {}", topics[i % 5], i),
+            serde_json::json!({"i": i}),
+        );
+    }
+    c.bench_function("dedup_lookup_mixed_1024", |bencher| {
+        bencher.iter(|| d.get(black_box("kubernetes pod scheduling question variant 500")))
+    });
+
+    // adversarial: every entry shares the template vocabulary — worst
+    // case where the index degenerates to a full scan
+    let d2 = Deduper::new(0.6, 1024);
+    for i in 0..1024 {
+        d2.put(
             &format!("prompt number {i} about topic {i} and stuff"),
             serde_json::json!({"i": i}),
         );
     }
-    c.bench_function("dedup_lookup_1024_cache", |bencher| {
-        bencher.iter(|| d.get(black_box("prompt number 500 about topic 500 and stuff")))
+    c.bench_function("dedup_lookup_adversarial_1024", |bencher| {
+        bencher.iter(|| d2.get(black_box("prompt number 500 about topic 500 and stuff")))
     });
 }
 

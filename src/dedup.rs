@@ -1,24 +1,67 @@
 use lru::LruCache;
 use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+
+/// FxHash-style hasher for u64 keys — SipHash is the bottleneck when
+/// tallying thousands of index hits per lookup.
+#[derive(Default)]
+struct FxHasher(u64);
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x100000001b3);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// Semantic dedup: feature-set Jaccard similarity over normalized
 /// prompt text. Two prompts sharing >= min_similarity of their hashed
 /// word features are treated as the same request and the cached
 /// response is replayed.
 ///
-/// Deterministic — no model, no embeddings. The cache is a bounded
-/// LRU; a lookup scans entries comparing feature sets, which is cheap
-/// at the configured sizes (~1024 entries × ~20 features).
+/// Deterministic — no model, no embeddings. Lookups use an inverted
+/// index (feature → entry keys) so only entries sharing at least one
+/// feature are scored; unrelated cache entries are never touched.
+/// Cost is O(matches) not O(cache size).
 struct Entry {
     features: Arc<Vec<u64>>,
     response: Arc<serde_json::Value>,
 }
 
+struct Index {
+    cache: LruCache<u64, Entry>,
+    /// feature hash -> entry keys containing that feature.
+    inverted: FxMap<u64, Vec<u64>>,
+}
+
+impl Index {
+    fn remove_key(&mut self, key: u64) {
+        if let Some(e) = self.cache.pop(&key) {
+            for f in e.features.iter() {
+                if let Some(keys) = self.inverted.get_mut(f) {
+                    keys.retain(|k| *k != key);
+                    if keys.is_empty() {
+                        self.inverted.remove(f);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub struct Deduper {
     min_similarity: f64,
-    inner: Mutex<LruCache<u64, Entry>>,
+    inner: Mutex<Index>,
     hits: std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
 }
@@ -27,7 +70,10 @@ impl Deduper {
     pub fn new(min_similarity: f64, cache_size: usize) -> Self {
         Self {
             min_similarity,
-            inner: Mutex::new(LruCache::new(NonZeroUsize::new(cache_size.max(1)).unwrap())),
+            inner: Mutex::new(Index {
+                cache: LruCache::new(NonZeroUsize::new(cache_size.max(1)).unwrap()),
+                inverted: FxMap::default(),
+            }),
             hits: 0.into(),
             misses: 0.into(),
         }
@@ -39,17 +85,38 @@ impl Deduper {
         if features.is_empty() {
             return None;
         }
-        let mut cache = self.inner.lock();
-        let mut found_key = None;
-        for (k, e) in cache.iter() {
-            if jaccard(&features, &e.features) >= self.min_similarity {
-                found_key = Some(*k);
-                break;
+        let mut idx = self.inner.lock();
+
+        // candidates: entries sharing >= 1 feature, tallied
+        let mut counts: FxMap<u64, usize> = FxMap::default();
+        for f in &features {
+            if let Some(keys) = idx.inverted.get(f) {
+                for k in keys {
+                    *counts.entry(*k).or_insert(0) += 1;
+                }
             }
         }
-        if let Some(k) = found_key {
+
+        // exact Jaccard only on candidates that can possibly meet the
+        // threshold: shared >= min_similarity * min(len_a, len_b)
+        let mut best: Option<(u64, f64)> = None;
+        for (k, shared) in counts {
+            let Some(e) = idx.cache.peek(&k) else {
+                continue;
+            };
+            let min_len = features.len().min(e.features.len());
+            if (shared as f64) < self.min_similarity * min_len as f64 {
+                continue;
+            }
+            let sim = jaccard(&features, &e.features);
+            if sim >= self.min_similarity && best.map(|(_, s)| sim > s).unwrap_or(true) {
+                best = Some((k, sim));
+            }
+        }
+
+        if let Some((k, _)) = best {
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return cache.get(&k).map(|e| e.response.clone());
+            return idx.cache.get(&k).map(|e| e.response.clone());
         }
         self.misses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -64,7 +131,18 @@ impl Deduper {
         let key = features
             .iter()
             .fold(0xcbf29ce484222325u64, |a, f| a.rotate_left(7) ^ f);
-        self.inner.lock().put(
+        let mut idx = self.inner.lock();
+        // evict cleanly: remove the victim's index postings too
+        if idx.cache.len() == idx.cache.cap().get() {
+            if let Some((victim, _)) = idx.cache.peek_lru() {
+                let victim = *victim;
+                idx.remove_key(victim);
+            }
+        }
+        for f in &features {
+            idx.inverted.entry(*f).or_default().push(key);
+        }
+        idx.cache.put(
             key,
             Entry {
                 features: Arc::new(features),
@@ -77,7 +155,7 @@ impl Deduper {
         (
             self.hits.load(std::sync::atomic::Ordering::Relaxed),
             self.misses.load(std::sync::atomic::Ordering::Relaxed),
-            self.inner.lock().len(),
+            self.inner.lock().cache.len(),
         )
     }
 }
@@ -187,6 +265,16 @@ mod tests {
             serde_json::json!({}),
         );
         assert!(d.get("rust borrow checker rules").is_none());
+    }
+
+    #[test]
+    fn eviction_clears_index() {
+        let d = Deduper::new(0.9, 2);
+        d.put("alpha beta gamma", serde_json::json!({"n": 1}));
+        d.put("delta epsilon zeta", serde_json::json!({"n": 2}));
+        d.put("eta theta iota", serde_json::json!({"n": 3})); // evicts first
+        assert!(d.get("alpha beta gamma").is_none());
+        assert!(d.get("eta theta iota").is_some());
     }
 
     #[test]

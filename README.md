@@ -57,7 +57,7 @@ audit trail.
 |---|---|---|
 | tarpit | per-IP token bucket, adds delay instead of errors | ~0 (only on overage) |
 | blind | built-in credential regexes (OpenAI/AWS/GitHub/Slack/Google/JWT/PEM/Bearer keys) + literal Aho-Corasick → keyed `⟦EG:hash⟧` tokens; echoed secrets unblinded | ~4.3 µs |
-| dedup | word unigram+bigram feature sets, Jaccard ≥ `min_similarity` | ~1.7 µs |
+| dedup | word unigram+bigram feature sets, Jaccard ≥ `min_similarity`, inverted index | ~24 µs |
 | filter | Aho-Corasick blocklist; SSE streams are cut mid-flight | ~10 ns |
 | meter | upstream `usage` when present, chars/4 estimate otherwise | negligible |
 | audit | `{ts,type,data,prev_hash,hash}` SHA-256 chain, append-only | ~µs append |
@@ -74,15 +74,21 @@ edge_gate verify --ledger edge_gate_ledger.jsonl
 # or "CHAIN BROKEN at line 207" + exit 1
 ```
 
-**Checkpoints** — pin the tip, then prove later that history back to
-that point is unchanged:
+**Signed checkpoints** — pin the tip under an ed25519 key, then prove
+later that history back to that point is unchanged:
 
 ```sh
-edge_gate checkpoint --ledger edge_gate_ledger.jsonl --out cp.json
-cp cp.json /elsewhere/            # store the proof off-box
-edge_gate verify --ledger edge_gate_ledger.jsonl --checkpoint cp.json
+edge_gate keygen                            # one-time keypair
+echo <secret> > ~/edge_gate.key && chmod 600 ~/edge_gate.key
+edge_gate checkpoint --key-file ~/edge_gate.key --out cp.json
+cp cp.json /elsewhere/                      # store the proof off-box
+edge_gate verify --checkpoint cp.json
 # → "checkpoint tip present — history back to checkpoint intact"
 ```
+
+Unsigned checkpoints still work (`checkpoint` without `--key-file`);
+signed ones survive an attacker who can rewrite both the ledger and
+the checkpoint file.
 
 Or live: `GET /audit/verify`. Metrics: `GET /metrics` (Prometheus
 exposition, including `edge_gate_dedup_saved_usd`).
@@ -95,12 +101,15 @@ exposition, including `edge_gate_dedup_saved_usd`).
 |---|---|
 | blind request body (regex + Aho-Corasick) | ~4.3 µs |
 | feature_set (prompt fingerprint) | ~1.2 µs |
-| dedup lookup vs 1024-entry cache | ~0.46 µs |
+| dedup lookup, mixed cache (1024) | ~24 µs |
+| dedup lookup, adversarial shared-vocab cache (1024) | ~50 µs |
 | filter response | ~10 ns |
 
-Full pipeline ≈ **6 µs** added per request. The dedup scan is O(cache
-size × features) — trivial at the default 1024; raise `cache_size`
-past ~10k and it becomes the thing to index.
+Full pipeline ≈ **30 µs** added per request, ~50 µs worst case — vs.
+upstream latency measured in seconds. Dedup uses an inverted index
+(feature → entries) so only entries sharing ≥1 feature are scored; the
+adversarial column shows the degenerate case where *every* cached
+prompt shares vocabulary, which is the true scaling ceiling.
 
 ## Honest scope
 
@@ -111,9 +120,12 @@ past ~10k and it becomes the thing to index.
 - **Dedup is lexical similarity, not meaning.** "2+2?" and "two plus
   two" don't dedup; paraphrases sharing ~60% of word features do.
   Tune `min_similarity`.
-- **Streaming filter** scans accumulated text and cuts the stream on a
-  hit — a pattern split across chunk boundaries is caught once the
-  second half lands, so partial text may have already flowed.
+- **Streams are buffered, not chunked through.** `stream: true`
+  requests are accumulated upstream, filtered, cached, then delivered
+  as one SSE body — so nothing filtered ever reaches the client, and
+  dedup can replay streams, but the client sees no incremental tokens
+  (TTFT ≈ full upstream latency). Making it stream *and* filter
+  incrementally is the known tradeoff to revisit.
 - **The chain detects tampering; it doesn't prevent it.** An attacker
   who rewrites the file AND recomputes the chain defeats it — seal the
   ledger elsewhere (e.g. periodic external checkpointing) if you need
@@ -121,8 +133,9 @@ past ~10k and it becomes the thing to index.
 - HTTP/1.1 OpenAI-style JSON is the tested surface. Anthropic-shaped
   bodies pass through but usage/meter parsing expects `prompt_tokens`
   / `input_tokens` conventions.
-- Dedup lookup is a linear scan over the cache — sub-µs at 1024
-  entries, but it's the scaling ceiling to know about.
+- Dedup's inverted index bounds lookups to feature-sharing entries;
+  ~24µs typical, ~50µs when every cached prompt shares vocabulary.
+  That's the scaling ceiling to know about.
 
 ## Library use
 

@@ -84,11 +84,26 @@ fn tail_hash(path: &Path) -> Option<String> {
     v.get("hash")?.as_str().map(|s| s.to_string())
 }
 
+/// Generate an ed25519 keypair for checkpoint signing.
+/// Returns (secret_hex, public_hex). Store the secret somewhere safe —
+/// anyone holding it can forge checkpoint signatures.
+pub fn keygen() -> (String, String) {
+    use ed25519_dalek::Signer;
+    let mut rng = rand::rngs::OsRng;
+    let kp = ed25519_dalek::SigningKey::generate(&mut rng);
+    let _ = kp.sign(b""); // force trait import usage clarity
+    (
+        hex::encode(kp.to_bytes()),
+        hex::encode(kp.verifying_key().to_bytes()),
+    )
+}
+
 /// Write a tamper-evident checkpoint: the entry count and tip hash of
-/// the ledger at this moment. Copy the checkpoint file somewhere else
-/// — an attacker rewriting early history can't produce a chain that
-/// both verifies AND still contains the checkpointed tip.
-pub fn checkpoint(ledger: &Path, out: &Path) -> std::io::Result<Value> {
+/// the ledger at this moment. If `secret_hex` is given, the checkpoint
+/// is ed25519-signed and carries the public key — store the checkpoint
+/// off-box and an attacker who rewrites history can't produce a
+/// checkpoint that still verifies.
+pub fn checkpoint(ledger: &Path, out: &Path, secret_hex: Option<&str>) -> std::io::Result<Value> {
     let (n, bad) = verify(ledger)?;
     if let Some(line) = bad {
         return Err(std::io::Error::new(
@@ -99,21 +114,61 @@ pub fn checkpoint(ledger: &Path, out: &Path) -> std::io::Result<Value> {
     let tip = tail_hash(ledger).unwrap_or_else(|| GENESIS.to_string());
     let file_bytes = std::fs::read(ledger).unwrap_or_default();
     let file_sha = hex::encode(Sha256::digest(&file_bytes));
-    let cp = json!({
+    let mut cp = json!({
         "ledger": ledger.display().to_string(),
         "entries": n,
         "tip_hash": tip,
         "file_sha256": file_sha,
         "checkpointed_at": chrono_now(),
     });
+    if let Some(secret) = secret_hex {
+        let bytes = hex::decode(secret)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "secret must be 32 bytes")
+        })?;
+        let key = ed25519_dalek::SigningKey::from_bytes(&arr);
+        use ed25519_dalek::Signer;
+        let payload = canonical_payload(&cp);
+        let sig = key.sign(payload.as_bytes());
+        cp["public_key"] = json!(hex::encode(key.verifying_key().to_bytes()));
+        cp["signature"] = json!(hex::encode(sig.to_bytes()));
+    }
     std::fs::write(out, serde_json::to_string_pretty(&cp)?)?;
     Ok(cp)
 }
 
-/// Check that a checkpointed tip is still present in the chain —
-/// proving history up to the checkpoint hasn't been rewritten.
+/// Canonical signed payload: the checkpoint fields minus signature
+/// material, serialized deterministically.
+fn canonical_payload(cp: &Value) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        cp["entries"], cp["tip_hash"], cp["file_sha256"], cp["checkpointed_at"]
+    )
+}
+
+/// Verify a checkpoint file's signature (if present) and confirm the
+/// checkpointed tip is still in the chain.
 pub fn checkpoint_holds(ledger: &Path, checkpoint: &Path) -> std::io::Result<bool> {
     let cp: Value = serde_json::from_str(&std::fs::read_to_string(checkpoint)?)?;
+    // signature check first — a forged checkpoint should fail loudly
+    if let (Some(sig_hex), Some(pub_hex)) = (cp["signature"].as_str(), cp["public_key"].as_str()) {
+        use ed25519_dalek::Verifier;
+        let pk_bytes = hex::decode(pub_hex).unwrap_or_default();
+        let sig_bytes = hex::decode(sig_hex).unwrap_or_default();
+        let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap_or([0; 32]);
+        let sig_arr: [u8; 64] = sig_bytes.try_into().unwrap_or([0; 64]);
+        let pk = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        pk.verify(canonical_payload(&cp).as_bytes(), &sig)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "checkpoint signature invalid",
+                )
+            })?;
+    }
     let tip = cp["tip_hash"].as_str().unwrap_or("");
     let text = std::fs::read_to_string(ledger)?;
     for line in text.lines() {

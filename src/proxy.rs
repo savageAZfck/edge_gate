@@ -195,15 +195,26 @@ async fn forward_inner(
         .to_string();
     let fingerprint = parsed.as_ref().map(prompt_text).unwrap_or_default();
 
-    // 3. dedup (non-streaming, parseable JSON only)
-    if !is_stream && parsed.is_some() {
+    // 3. dedup (any parseable request — streams replay cached SSE)
+    if parsed.is_some() {
         if let Some(d) = &s.deduper {
             if let Some(cached) = d.get(&fingerprint) {
                 s.meter.record_dedup_save(&model);
                 s.audit.record(
                     "dedup_hit",
-                    json!({"path": path, "model": model, "upstream": upstream_name}),
+                    json!({"path": path, "model": model, "upstream": upstream_name, "stream": is_stream}),
                 );
+                if let Some(sse) = cached.get("_edge_gate_sse").and_then(|v| v.as_str()) {
+                    return Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .header("x-edge-gate", "dedup")
+                        .body(axum::body::Body::from(sse.to_string()))
+                        .unwrap_or_else(|_| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, "replay failed").into_response()
+                        });
+                }
                 return (
                     StatusCode::OK,
                     [
@@ -271,7 +282,7 @@ async fn forward_inner(
     );
 
     if is_stream {
-        return stream_response(s, upstream_resp, status).await;
+        return stream_response(s, upstream_resp, status, fingerprint, model, path).await;
     }
 
     // 5. buffered response path
@@ -323,53 +334,66 @@ async fn forward_inner(
         .into_response()
 }
 
-/// SSE passthrough with incremental filtering: each `data:` payload is
-/// scanned; on a blocklist hit the stream is cut and a refusal event is
-/// emitted instead of the remaining upstream bytes.
+/// SSE passthrough with incremental filtering: the upstream body is
+/// buffered while scanned; on a blocklist hit the stream is replaced by
+/// a refusal event instead of the remaining upstream bytes. Completed
+/// clean streams are cached so dedup can replay them.
 async fn stream_response(
     s: Arc<AppState>,
     upstream_resp: reqwest::Response,
     status: StatusCode,
+    fingerprint: String,
+    model: String,
+    path: String,
 ) -> Response {
     let filter = s.filter.clone();
     let filter_active = filter.is_active();
-    let stream = upstream_resp.bytes_stream();
+    let mut stream = upstream_resp.bytes_stream();
+    let mut accumulated = String::new();
+    let mut blocked = false;
 
-    let out = futures_util::stream::unfold(
-        (stream, String::new(), false),
-        move |(mut stream, mut accumulated, mut blocked)| {
-            let filter = filter.clone();
-            async move {
-                if blocked {
-                    return None;
-                }
-                match stream.next().await {
-                    Some(Ok(chunk)) => {
-                        accumulated.push_str(&String::from_utf8_lossy(&chunk));
-                        if filter_active && filter.check(&accumulated) {
-                            blocked = true;
-                            let refusal = format!("data: {}\n\n", REFUSAL);
-                            return Some((
-                                Ok::<Bytes, std::io::Error>(Bytes::from(refusal)),
-                                (stream, accumulated, blocked),
-                            ));
-                        }
-                        Some((Ok(chunk), (stream, accumulated, blocked)))
-                    }
-                    Some(Err(e)) => {
-                        let msg = format!("data: {{\"error\":\"upstream stream: {e}\"}}\n\n");
-                        Some((Ok(Bytes::from(msg)), (stream, accumulated, true)))
-                    }
-                    None => None,
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                accumulated.push_str(&String::from_utf8_lossy(&bytes));
+                if filter_active && filter.check(&accumulated) {
+                    blocked = true;
+                    accumulated = format!("data: {}\n\n", REFUSAL);
+                    s.audit.record(
+                        "filter_block",
+                        json!({"path": path, "model": model, "stream": true}),
+                    );
+                    break;
                 }
             }
-        },
+            Err(e) => {
+                accumulated.push_str(&format!("data: {{\"error\":\"upstream stream: {e}\"}}\n\n"));
+                break;
+            }
+        }
+    }
+
+    if status.is_success() && !blocked && !fingerprint.is_empty() {
+        if let Some(d) = &s.deduper {
+            d.put(&fingerprint, json!({"_edge_gate_sse": accumulated}));
+        }
+    }
+    // metering is best-effort for streams: OpenAI only sends usage with
+    // stream_options.include_usage, so estimate from buffered size.
+    s.meter.record(&model, None, accumulated.len());
+    s.audit.record(
+        "response",
+        json!({
+            "path": path, "model": model, "status": status.as_u16(),
+            "stream": true, "filtered": blocked,
+        }),
     );
+
     Response::builder()
         .status(status)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
-        .body(axum::body::Body::from_stream(out))
+        .body(axum::body::Body::from(accumulated))
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "stream build failed").into_response()
         })
