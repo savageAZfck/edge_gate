@@ -32,8 +32,11 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/healthz", axum::routing::get(healthz))
         .route("/metrics", axum::routing::get(metrics))
         .route("/audit/verify", axum::routing::get(audit_verify))
-        .route("/v1/*path", axum::routing::post(forward))
-        .route("/{upstream}/v1/*path", axum::routing::post(forward_named))
+        .route("/v1/*path", axum::routing::post(forward).get(forward_get))
+        .route(
+            "/{upstream}/v1/*path",
+            axum::routing::post(forward_named).get(forward_get_named),
+        )
         .with_state(state)
 }
 
@@ -64,6 +67,61 @@ async fn audit_verify(State(s): State<Arc<AppState>>) -> impl IntoResponse {
             axum::Json(json!({"entries": n, "first_bad_line": bad, "ok": bad.is_none()}))
         }
         Err(e) => axum::Json(json!({"error": e.to_string()})),
+    }
+}
+
+/// GET passthrough (e.g. /v1/models): no blinding/dedup — read-only
+/// upstream fetch with the same upstream-selection rules.
+async fn forward_get(
+    State(s): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    get_inner(s, headers, path, None).await
+}
+
+async fn forward_get_named(
+    State(s): State<Arc<AppState>>,
+    Path((upstream, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    get_inner(s, headers, path, Some(upstream)).await
+}
+
+async fn get_inner(
+    s: Arc<AppState>,
+    headers: HeaderMap,
+    path: String,
+    named: Option<String>,
+) -> Response {
+    let upstream_name = named.unwrap_or_else(|| s.default_upstream.clone());
+    let Some(upstream) = s.cfg.upstreams.get(&upstream_name) else {
+        return err(
+            StatusCode::BAD_GATEWAY,
+            &format!("unknown upstream '{upstream_name}'"),
+        );
+    };
+    let url = format!("{}/v1/{}", upstream.url.trim_end_matches('/'), path);
+    let mut req = s.client.get(&url).timeout(std::time::Duration::from_millis(
+        upstream.timeout_ms.unwrap_or(120_000),
+    ));
+    if let Some(key) = &upstream.api_key {
+        req = req.bearer_auth(key);
+    } else if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        req = req.header("authorization", auth);
+    }
+    match req.send().await {
+        Ok(r) => {
+            let status = r.status();
+            let body = r.bytes().await.unwrap_or_default();
+            (
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
+                [("content-type", "application/json")],
+                body,
+            )
+                .into_response()
+        }
+        Err(e) => err(StatusCode::BAD_GATEWAY, &format!("upstream: {e}")),
     }
 }
 
@@ -165,6 +223,9 @@ async fn forward_inner(
         .client
         .post(&url)
         .header("content-type", "application/json")
+        .timeout(std::time::Duration::from_millis(
+            upstream.timeout_ms.unwrap_or(120_000),
+        ))
         .body(outbound.clone());
     for (k, v) in headers.iter() {
         let name = k.as_str();

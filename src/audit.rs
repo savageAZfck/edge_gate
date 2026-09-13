@@ -84,6 +84,51 @@ fn tail_hash(path: &Path) -> Option<String> {
     v.get("hash")?.as_str().map(|s| s.to_string())
 }
 
+/// Write a tamper-evident checkpoint: the entry count and tip hash of
+/// the ledger at this moment. Copy the checkpoint file somewhere else
+/// — an attacker rewriting early history can't produce a chain that
+/// both verifies AND still contains the checkpointed tip.
+pub fn checkpoint(ledger: &Path, out: &Path) -> std::io::Result<Value> {
+    let (n, bad) = verify(ledger)?;
+    if let Some(line) = bad {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("refusing to checkpoint a broken chain (bad line {line})"),
+        ));
+    }
+    let tip = tail_hash(ledger).unwrap_or_else(|| GENESIS.to_string());
+    let file_bytes = std::fs::read(ledger).unwrap_or_default();
+    let file_sha = hex::encode(Sha256::digest(&file_bytes));
+    let cp = json!({
+        "ledger": ledger.display().to_string(),
+        "entries": n,
+        "tip_hash": tip,
+        "file_sha256": file_sha,
+        "checkpointed_at": chrono_now(),
+    });
+    std::fs::write(out, serde_json::to_string_pretty(&cp)?)?;
+    Ok(cp)
+}
+
+/// Check that a checkpointed tip is still present in the chain —
+/// proving history up to the checkpoint hasn't been rewritten.
+pub fn checkpoint_holds(ledger: &Path, checkpoint: &Path) -> std::io::Result<bool> {
+    let cp: Value = serde_json::from_str(&std::fs::read_to_string(checkpoint)?)?;
+    let tip = cp["tip_hash"].as_str().unwrap_or("");
+    let text = std::fs::read_to_string(ledger)?;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if v["hash"].as_str() == Some(tip) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Verify a ledger file. Returns (entries_checked, first_bad_line).
 pub fn verify(path: &Path) -> std::io::Result<(u64, Option<u64>)> {
     let text = std::fs::read_to_string(path)?;

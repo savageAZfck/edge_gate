@@ -112,7 +112,7 @@ pub fn prompt_text(body: &serde_json::Value) -> String {
 
 /// Sorted set of hashed features: lowercase word unigrams + word
 /// bigrams. Unigrams carry short prompts; bigrams add order signal.
-fn feature_set(text: &str) -> Vec<u64> {
+pub fn feature_set(text: &str) -> Vec<u64> {
     let words: Vec<String> = text.split_whitespace().map(|w| w.to_lowercase()).collect();
     let mut feats = Vec::with_capacity(words.len() * 2);
     for w in &words {

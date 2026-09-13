@@ -1,13 +1,5 @@
-mod audit;
-mod blind;
-mod config;
-mod dedup;
-mod filter;
-mod meter;
-mod proxy;
-mod tarpit;
-
 use clap::{Parser, Subcommand};
+use edge_gate::{audit, blind, config, dedup, filter, meter, proxy, tarpit};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -34,6 +26,17 @@ enum Cmd {
         /// Ledger path.
         #[arg(short, long, default_value = "edge_gate_ledger.jsonl")]
         ledger: std::path::PathBuf,
+        /// Optional checkpoint file — also proves the checkpointed tip
+        /// is still present in the chain.
+        #[arg(long)]
+        checkpoint: Option<std::path::PathBuf>,
+    },
+    /// Write a tamper-evident checkpoint of the ledger tip.
+    Checkpoint {
+        #[arg(short, long, default_value = "edge_gate_ledger.jsonl")]
+        ledger: std::path::PathBuf,
+        #[arg(short, long, default_value = "edge_gate_checkpoint.json")]
+        out: std::path::PathBuf,
     },
 }
 
@@ -44,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Verify { ledger } => {
+        Cmd::Verify { ledger, checkpoint } => {
             let (n, bad) = audit::verify(&ledger)?;
             match bad {
                 None => println!("{n} entries verified, chain intact"),
@@ -53,6 +56,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            if let Some(cp) = checkpoint {
+                match audit::checkpoint_holds(&ledger, &cp) {
+                    Ok(true) => {
+                        println!("checkpoint tip present — history back to checkpoint intact")
+                    }
+                    Ok(false) => {
+                        println!("CHECKPOINT FAILED: checkpointed tip is not in the chain");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        println!("checkpoint unreadable: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Cmd::Checkpoint { ledger, out } => {
+            let cp = audit::checkpoint(&ledger, &out)?;
+            println!(
+                "checkpoint written: {} entries, tip {}",
+                cp["entries"],
+                &cp["tip_hash"].as_str().unwrap_or("")[..16]
+            );
         }
         Cmd::Serve { config } => {
             let cfg = config::Config::load(&config)?;
@@ -69,7 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "listen": cfg.listen}),
             );
             let state = Arc::new(proxy::AppState {
-                blinder: blind::Blinder::new(&cfg.blinding.patterns),
+                blinder: blind::Blinder::new(
+                    &cfg.blinding.patterns,
+                    cfg.blinding.builtin,
+                    cfg.blinding.unblind_response,
+                ),
                 deduper: cfg
                     .dedup
                     .enabled
@@ -98,6 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::net::TcpListener::bind(listen).await?,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+                println!("\nedge_gate shutting down");
+            })
             .await?;
         }
     }

@@ -1,9 +1,13 @@
 # edge_gate
 
+[![CI](https://github.com/savageAZfck/edge_gate/actions/workflows/ci.yml/badge.svg)](https://github.com/savageAZfck/edge_gate/actions/workflows/ci.yml)
+
 A local LLM edge gateway. One Rust binary that sits between your apps
-and any OpenAI-compatible endpoint, and does five things to every
+and any OpenAI-compatible endpoint, and does seven things to every
 request before it leaves your machine — and every response on the way
-back.
+back. Total pipeline overhead: **~6 µs per request** (measured, see
+[benchmarks](#benchmarks)) — against upstream latency measured in
+seconds, the gate is effectively free.
 
 ```
 app → edge_gate → upstream API
@@ -49,14 +53,18 @@ audit trail.
 
 ## What each stage actually does
 
-| Stage | Mechanism | Deterministic? |
+| Stage | Mechanism | Cost |
 |---|---|---|
-| tarpit | per-IP token bucket, adds delay instead of errors | yes |
-| blind | literal-substring Aho-Corasick → keyed `⟦EG:hash⟧` tokens; response unblinds | yes |
-| dedup | word unigram+bigram feature sets, Jaccard ≥ `min_similarity` | yes |
-| filter | Aho-Corasick blocklist; SSE streams are cut mid-flight | yes |
-| meter | upstream `usage` when present, chars/4 estimate otherwise | yes |
-| audit | `{ts,type,data,prev_hash,hash}` SHA-256 chain, append-only | verifiable |
+| tarpit | per-IP token bucket, adds delay instead of errors | ~0 (only on overage) |
+| blind | built-in credential regexes (OpenAI/AWS/GitHub/Slack/Google/JWT/PEM/Bearer keys) + literal Aho-Corasick → keyed `⟦EG:hash⟧` tokens; echoed secrets unblinded | ~4.3 µs |
+| dedup | word unigram+bigram feature sets, Jaccard ≥ `min_similarity` | ~1.7 µs |
+| filter | Aho-Corasick blocklist; SSE streams are cut mid-flight | ~10 ns |
+| meter | upstream `usage` when present, chars/4 estimate otherwise | negligible |
+| audit | `{ts,type,data,prev_hash,hash}` SHA-256 chain, append-only | ~µs append |
+
+Blinding works **at zero config** — the built-in regex set catches
+common credential shapes out of the box; `blinding.patterns` adds your
+literal strings (project names, internal hostnames) on top.
 
 ## Verify the audit trail
 
@@ -66,14 +74,40 @@ edge_gate verify --ledger edge_gate_ledger.jsonl
 # or "CHAIN BROKEN at line 207" + exit 1
 ```
 
+**Checkpoints** — pin the tip, then prove later that history back to
+that point is unchanged:
+
+```sh
+edge_gate checkpoint --ledger edge_gate_ledger.jsonl --out cp.json
+cp cp.json /elsewhere/            # store the proof off-box
+edge_gate verify --ledger edge_gate_ledger.jsonl --checkpoint cp.json
+# → "checkpoint tip present — history back to checkpoint intact"
+```
+
 Or live: `GET /audit/verify`. Metrics: `GET /metrics` (Prometheus
 exposition, including `edge_gate_dedup_saved_usd`).
 
+## Benchmarks
+
+`cargo bench` — criterion, this machine (Apple Silicon):
+
+| stage | time |
+|---|---|
+| blind request body (regex + Aho-Corasick) | ~4.3 µs |
+| feature_set (prompt fingerprint) | ~1.2 µs |
+| dedup lookup vs 1024-entry cache | ~0.46 µs |
+| filter response | ~10 ns |
+
+Full pipeline ≈ **6 µs** added per request. The dedup scan is O(cache
+size × features) — trivial at the default 1024; raise `cache_size`
+past ~10k and it becomes the thing to index.
+
 ## Honest scope
 
-- **Blinding is literal-substring, not NER.** Put your actual secrets,
-  key formats, and sensitive phrases in `blinding.patterns` (or
-  `patterns_file`). It will not find a secret it wasn't told about.
+- **Blinding is pattern-based, not NER.** The built-in regexes catch
+  credential *shapes*; `blinding.patterns` catches your literal
+  strings. A secret matching neither still passes through — blinding
+  is a floor, not a guarantee.
 - **Dedup is lexical similarity, not meaning.** "2+2?" and "two plus
   two" don't dedup; paraphrases sharing ~60% of word features do.
   Tune `min_similarity`.
@@ -87,14 +121,22 @@ exposition, including `edge_gate_dedup_saved_usd`).
 - HTTP/1.1 OpenAI-style JSON is the tested surface. Anthropic-shaped
   bodies pass through but usage/meter parsing expects `prompt_tokens`
   / `input_tokens` conventions.
+- Dedup lookup is a linear scan over the cache — sub-µs at 1024
+  entries, but it's the scaling ceiling to know about.
+
+## Library use
+
+The stages are a library too — `use edge_gate::blind::Blinder` etc. —
+if you want the pipeline without the proxy.
 
 ## Tests
 
 ```sh
-cargo test
+cargo test && cargo bench
 ```
 
-10 unit tests (blinding round-trip, dedup similarity, tarpit buckets,
-audit tamper detection) + 1 integration test that spawns the real
-gateway against a mock upstream and exercises proxy → blind → dedup →
-unblind → audit verify end to end.
+13 unit tests (blinding round-trip + builtin credential detection,
+dedup similarity, tarpit buckets, audit tamper detection) + 1
+integration test that spawns the real gateway against a mock upstream
+and exercises proxy → blind → dedup → unblind → audit verify end to
+end. CI runs fmt/clippy/test on every push.

@@ -27,6 +27,9 @@ pub struct Upstream {
     pub url: String,
     /// Optional bearer token injected as Authorization header.
     pub api_key: Option<String>,
+    /// Upstream response timeout in milliseconds (default 120s —
+    /// long enough for slow LLM streams, short enough to fail).
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -45,8 +48,11 @@ pub struct DedupConfig {
 pub struct BlindConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Literal strings and regexes are not mixed: entries are literal
-    /// substrings to blind before the request leaves the machine.
+    /// Built-in credential-shape regexes (API keys, JWTs, PEM…).
+    /// On by default — blinding works at zero config.
+    #[serde(default = "default_true")]
+    pub builtin: bool,
+    /// Literal substrings to blind on top of the builtins.
     #[serde(default)]
     pub patterns: Vec<String>,
     /// File with one pattern per line (merged with `patterns`).
@@ -136,6 +142,7 @@ impl Default for BlindConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            builtin: true,
             patterns: Vec::new(),
             patterns_file: None,
             unblind_response: true,

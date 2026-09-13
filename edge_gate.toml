@@ -5,6 +5,7 @@ listen = "127.0.0.1:8400"
 [upstreams.openai]
 url = "https://api.openai.com"
 # api_key = "sk-..."   # or pass Authorization header through from the client
+# timeout_ms = 120000  # upstream timeout (default 2 min)
 
 # Point any OpenAI-compatible endpoint at edge_gate:
 #   curl http://127.0.0.1:8400/v1/chat/completions ...
@@ -21,8 +22,10 @@ cache_size = 1024
 
 [blinding]
 enabled = true
+builtin = true           # credential-shape regexes, on at zero config
 unblind_response = true
-# Literal substrings to blind before requests leave this machine.
+# Literal substrings to blind on top of the builtins
+# (project names, internal hostnames — anything literal).
 # One per line in a file works too:
 # patterns_file = "~/.edge_gate/secrets.txt"
 patterns = []

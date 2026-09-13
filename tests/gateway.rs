@@ -101,6 +101,7 @@ output_per_mtok = 2.0
 
     /// Start edge_gate as a subprocess on an ephemeral port.
     /// Returns (child, gateway_addr).
+    #[allow(clippy::zombie_processes)] // test kills the child explicitly
     pub async fn spawn(cfg_path: &std::path::Path) -> (std::process::Child, SocketAddr) {
         // grab a free port first
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
