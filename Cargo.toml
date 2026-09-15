@@ -3,7 +3,7 @@ name = "edge_gate"
 version = "0.1.0"
 edition = "2021"
 description = "Local LLM edge gateway: dedup, blind, filter, meter, audit"
-license = "LicenseRef-Proprietary"
+license = "FSL-1.1-ALv2"
 
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
