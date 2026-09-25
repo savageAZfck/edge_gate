@@ -5,7 +5,7 @@
 A local LLM edge gateway. One Rust binary that sits between your apps
 and any OpenAI-compatible endpoint, and does seven things to every
 request before it leaves your machine — and every response on the way
-back. Total pipeline overhead: **~6 µs per request** (measured, see
+back. Total pipeline overhead: **~30 µs per request** (measured, see
 [benchmarks](#benchmarks)) — against upstream latency measured in
 seconds, the gate is effectively free.
 
@@ -148,7 +148,7 @@ if you want the pipeline without the proxy.
 cargo test && cargo bench
 ```
 
-13 unit tests (blinding round-trip + builtin credential detection,
+14 unit tests (blinding round-trip + builtin credential detection,
 dedup similarity, tarpit buckets, audit tamper detection) + 1
 integration test that spawns the real gateway against a mock upstream
 and exercises proxy → blind → dedup → unblind → audit verify end to
