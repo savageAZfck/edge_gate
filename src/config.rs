@@ -23,7 +23,7 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Upstream {
-    /// Base URL, e.g. "https://api.openai.com" or "http://127.0.0.1:8080"
+    /// Base URL, e.g. `https://api.openai.com` or `http://127.0.0.1:8080`
     pub url: String,
     /// Optional bearer token injected as Authorization header.
     pub api_key: Option<String>,

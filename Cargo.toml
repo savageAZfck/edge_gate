@@ -1,7 +1,8 @@
 [package]
 name = "edge_gate"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+rust-version = "1.75"
 description = "Local LLM edge gateway: dedup, blind, filter, meter, audit"
 license = "MIT"
 repository = "https://github.com/savageAZfck/edge_gate"
